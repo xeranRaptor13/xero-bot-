@@ -24,7 +24,7 @@ WHAT IT DOES
     for the data) and builds tick candles from them (TICKS_PER_CANDLE ticks each).
     A candle closes when the first tick of the NEXT candle arrives, so that
     tick is bar 0 at the moment of judging (same as before).
-  * AUTO-TRADING (optional, OFF unless DERIV_PAT + DERIV_ACCOUNT_ID are set): every LIVE, accepted 5-tick
+  * AUTO-TRADING (optional, OFF unless DERIV_PAT (+ DERIV_APP_ID) is set): every LIVE, accepted 5-tick
     BUY / SELL entry (the same ones that send the Telegram line) opens a Deriv MULTUP / MULTDOWN contract on the
     base symbol, using the stake, TP / SL, MAX_OPEN_TRADES and per-symbol multipliers of xero_trader_1m.py.
     15-tick signals, HIST, BLOCKED, INVALID and IGNORED rows never trade. Real accounts need ALLOW_REAL_TRADING=1.
@@ -819,7 +819,8 @@ CLOSE_ON_EXIT = True
 # ---- Credentials (environment variables; nothing is stored in this file) ----
 #   DERIV_PAT         Personal Access Token with the `trade` scope (or an OAuth access token)
 #   DERIV_APP_ID      App ID registered on developers.deriv.com (needed for PAT tokens)
-#   DERIV_ACCOUNT_ID  the demo or real account id to trade on
+#   DERIV_ACCOUNT_ID  OPTIONAL. Leave it empty and the program finds your DEMO account from the token by itself
+#                     (a REAL account is used only when ALLOW_REAL_TRADING=1)
 #   DERIV_CURRENCY    optional; otherwise read from the account balance (fallback USD)
 #   ALLOW_REAL_TRADING=1   required before the program will trade on a REAL account
 DERIV_PAT          = os.environ.get("DERIV_PAT", "")
@@ -834,7 +835,7 @@ SIGNAL_MAX_AGE_SECONDS = 20     # a queued signal older than this is dropped, ne
 trade_lock   = threading.RLock()
 trade_queue  = queue.Queue()
 trader = {
-    'enabled':    bool(DERIV_PAT and DERIV_ACCOUNT_ID),
+    'enabled':    bool(DERIV_PAT),
     'ready':      False,        # authenticated trading socket is open
     'ws':         None,
     'mode':       None,         # 'DEMO' / 'REAL'
@@ -863,6 +864,20 @@ def _trade_csv(event, symbol, direction, contract_id, detail, profit=""):
             if new:
                 w.writerow(["time", "event", "symbol", "direction", "contract_id", "detail", "profit"])
             w.writerow([get_dt(), event, symbol, direction, contract_id, detail, profit])
+
+
+def _run_label():
+    """Where is the bot running? On GitHub Actions it names the run, otherwise it just says 'local'."""
+    if os.environ.get("GITHUB_ACTIONS") == "true":
+        return f"GitHub Actions (run #{os.environ.get('GITHUB_RUN_NUMBER', '?')})"
+    return "local machine"
+
+
+_notified = {'started': False, 'error': ''}
+
+
+def _notify_status(title, body):
+    send_telegram(f"🤖 <b>XERO BOT — {title}</b>\n━━━━━━━━━━━━━━━━━━━━\n{body}\nRunning on: {_run_label()}\nTime: {get_dt()}")
 
 
 def _trade_notify(title, symbol, direction, extra):
@@ -958,11 +973,35 @@ def _close_trades(symbol, direction):
 
 # ---------- trading WebSocket (authenticated, separate from the public candle feed) ----------
 
+ACCOUNTS_URL = "https://api.derivws.com/trading/v1/options/accounts"
+_resolved_account = {'id': DERIV_ACCOUNT_ID or ""}
+
+
+def _find_account_id(headers):
+    """DERIV_ACCOUNT_ID not set: ask Deriv which accounts this token owns and pick one.
+    DEMO by default; a REAL account is chosen only when ALLOW_REAL_TRADING=1."""
+    r = requests.get(ACCOUNTS_URL, headers=headers, timeout=15)
+    if r.status_code != 200:
+        raise RuntimeError(f"Could not list accounts: HTTP {r.status_code} {r.text[:200]}")
+    accounts = r.json().get('data') or []
+    want = 'real' if ALLOW_REAL_TRADING else 'demo'
+    for a in accounts:
+        if a.get('account_type') == want and a.get('status', 'active') == 'active' and a.get('account_id'):
+            acc = a['account_id']
+            print(f"[{get_ts()}] Using {want.upper()} account {acc[:3]}****  (found automatically from the token)")
+            return acc
+    found = ", ".join(sorted({f"{a.get('account_type')}/{a.get('status')}" for a in accounts})) or "none"
+    raise RuntimeError(f"No active {want} account found for this token (accounts seen: {found}). "
+                       f"Set DERIV_ACCOUNT_ID yourself or check the token.")
+
+
 def _get_otp_url():
     headers = {"Authorization": f"Bearer {DERIV_PAT}"}
     if DERIV_APP_ID:
         headers["Deriv-App-ID"] = DERIV_APP_ID
-    r = requests.post(OTP_URL.format(account_id=DERIV_ACCOUNT_ID), headers=headers, timeout=15)
+    if not _resolved_account['id']:
+        _resolved_account['id'] = _find_account_id(headers)
+    r = requests.post(OTP_URL.format(account_id=_resolved_account['id']), headers=headers, timeout=15)
     if r.status_code != 200:
         raise RuntimeError(f"OTP request failed: HTTP {r.status_code} {r.text[:200]}")
     return r.json()['data']['url']
@@ -975,6 +1014,14 @@ def _t_send(ws, obj):
 def _t_on_open(ws):
     trader['ready'] = True
     print(f"[{get_ts()}] Trading socket connected ({trader['mode']} account)")
+    if not _notified['started']:
+        _notified['started'] = True
+        _notify_status("STARTED ✅",
+                       f"Auto-trading is ON ({trader['mode']} account)\n"
+                       f"Stake: {BASE_STAKE} | TP: {TAKE_PROFIT} | SL: {STOP_LOSS}\n"
+                       f"Max open trades: {MAX_OPEN_TRADES} | Close on EXIT: {CLOSE_ON_EXIT}\n"
+                       f"Waiting for live signals — you will get a message for every trade.")
+    _notified['error'] = ''
     _t_send(ws, {"balance": 1, "req_id": next(req_counter)})
     _t_send(ws, {"portfolio": 1, "req_id": next(req_counter)})
     with trade_lock:
@@ -1117,6 +1164,9 @@ def _run_trade_ws():
         except Exception as e:
             trader['last_error'] = str(e)
             print(f"[{get_ts()}] ❌ Could not get a trading session: {e}  (retrying in {backoff}s)")
+            if _notified['error'] != str(e)[:80]:
+                _notified['error'] = str(e)[:80]
+                _notify_status("TRADING NOT CONNECTED ❌", f"{str(e)[:300]}\nThe bot keeps retrying; signals still run.")
             time.sleep(backoff)
             backoff = min(backoff * 2, 60)
             continue
@@ -1124,8 +1174,9 @@ def _run_trade_ws():
         trader['mode'] = 'DEMO' if '/ws/demo' in url else 'REAL'
         if trader['mode'] == 'REAL' and not ALLOW_REAL_TRADING:
             trader['enabled'] = False
-            print(f"[{get_ts()}] ⛔ DERIV_ACCOUNT_ID is a REAL account. Trading is OFF. "
+            print(f"[{get_ts()}] ⛔ The trading account is a REAL account. Trading is OFF. "
                   f"Set ALLOW_REAL_TRADING=1 to allow real-money trades.")
+            _notify_status("TRADING OFF ⛔", "The account is a REAL account and ALLOW_REAL_TRADING is not set to 1.")
             return
         ws = websocket.WebSocketApp(url, on_open=_t_on_open, on_message=_t_on_message,
                                     on_error=_t_on_error, on_close=_t_on_close)
@@ -1139,8 +1190,9 @@ def _run_trade_ws():
 
 def start_trader():
     if not trader['enabled']:
-        print("  ⚠ Auto-trading is OFF — set DERIV_PAT and DERIV_ACCOUNT_ID (and DERIV_APP_ID for a PAT) to turn it on.\n"
+        print("  ⚠ Auto-trading is OFF — set DERIV_PAT and DERIV_APP_ID to turn it on.\n"
               "    Signals still run exactly as before.\n")
+        _notify_status("STARTED (signals only)", "Auto-trading is OFF: DERIV_PAT is not set. Signals still run.")
         return
     print(f"  Auto-trading: stake {BASE_STAKE}, TP {TAKE_PROFIT}, SL {STOP_LOSS}, max {MAX_OPEN_TRADES} open, "
           f"close on EXIT: {CLOSE_ON_EXIT}\n")
@@ -2758,6 +2810,10 @@ if __name__ == "__main__":
             time.sleep(30)
     except KeyboardInterrupt:
         running = False
+        if os.environ.get("GITHUB_ACTIONS") == "true":
+            _notify_status("RUN ENDED ⏹", "The 5h50m run is finished. A new run starts at the next scheduled time (about 10 minutes).\n"
+                                           "Any open trade keeps its TP / SL on Deriv.")
+            time.sleep(4)   # give the Telegram message time to leave before the process exits
         try:
             ws_app.close()
         except Exception:

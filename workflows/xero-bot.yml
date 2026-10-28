@@ -33,7 +33,7 @@ jobs:
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
           DERIV_PAT:         ${{ secrets.DERIV_PAT }}
           DERIV_APP_ID:      ${{ secrets.DERIV_APP_ID }}
-          DERIV_ACCOUNT_ID:  ${{ secrets.DERIV_ACCOUNT_ID }}
+          DERIV_ACCOUNT_ID: ${{ secrets.DERIV_ACCOUNT_ID }}   # optional - leave the secret out and the bot finds the demo account itself
           ALLOW_REAL_TRADING: ${{ vars.ALLOW_REAL_TRADING || '0' }}
         run: |
           # SIGINT after 350 minutes = the bot's normal Ctrl+C shutdown. Exit code 124 just means "time is up".
