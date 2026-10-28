@@ -27,6 +27,7 @@ WHAT IT DOES
   * AUTO-TRADING (optional, OFF unless DERIV_PAT (+ DERIV_APP_ID) is set): every LIVE, accepted 5-tick
     BUY / SELL entry (the same ones that send the Telegram line) opens a Deriv MULTUP / MULTDOWN contract on the
     base symbol, using the stake, TP / SL, MAX_OPEN_TRADES and per-symbol multipliers of xero_trader_1m.py.
+    After a LOSING normal trade, the next trade is a RECOVERY trade (stake 2, TP 1, SL 1), then back to normal.
     15-tick signals, HIST, BLOCKED, INVALID and IGNORED rows never trade. Real accounts need ALLOW_REAL_TRADING=1.
   * Gives signals:
         BUY    MAP and SIGNAL both go below IntBB lower, MAP curves up, both are
@@ -780,9 +781,17 @@ import queue
 
 # ---- Trade settings ----
 BASE_STAKE      = 1
-TAKE_PROFIT     = 0.20
+TAKE_PROFIT     = 0.30
 STOP_LOSS       = 0.60
 MAX_OPEN_TRADES = 10
+
+# ---- Recovery trade ----
+# When a normal trade LOSES (profit below 0), the NEXT trade that opens is a RECOVERY trade with these settings.
+# After that one recovery trade (win or lose) the bot goes back to the normal stake / TP / SL. No further escalation.
+RECOVERY_ENABLED = True
+RECOVERY_STAKE   = 2
+RECOVERY_TP      = 1
+RECOVERY_SL      = 1
 
 SYMBOL_MULTIPLIER = {
     "R_10":    2000,
@@ -814,7 +823,7 @@ TRADE_CONTRACT = {'BUY': 'MULTUP', 'SELL': 'MULTDOWN'}   # BUY = price goes up, 
 
 # True: an EXIT signal also closes that symbol's open trade(s) of that direction.
 # False (default): trades are closed only by TAKE_PROFIT / STOP_LOSS.
-CLOSE_ON_EXIT = True
+CLOSE_ON_EXIT = False
 
 # ---- Credentials (environment variables; nothing is stored in this file) ----
 #   DERIV_PAT         Personal Access Token with the `trade` scope (or an OAuth access token)
@@ -843,7 +852,8 @@ trader = {
     'last_error': '',
 }
 open_trades  = {}   # contract_id -> {'symbol', 'direction', 'stake', 'opened'}
-pending_buys = {}   # req_id -> {'symbol', 'direction'}   (buy sent, no answer yet)
+pending_buys = {}   # req_id -> {'symbol', 'direction', 'recovery', 'stake', 'tp', 'sl'}   (buy sent, no answer yet)
+recovery_state = {'pending': False}   # True = the next trade opened is a RECOVERY trade (in memory only)
 
 
 def trade_banner():
@@ -935,28 +945,36 @@ def _open_trade(symbol, direction, queued_at):
         if len(open_trades) + len(pending_buys) >= MAX_OPEN_TRADES:
             return _skip(symbol, direction, f"MAX_OPEN_TRADES ({MAX_OPEN_TRADES}) reached")
         rid = next(req_counter)
-        pending_buys[rid] = {'symbol': symbol, 'direction': direction}
+        is_rec = bool(RECOVERY_ENABLED and recovery_state['pending'])
+        if is_rec:
+            recovery_state['pending'] = False      # this trade uses up the recovery turn
+        stake, tp, sl = (RECOVERY_STAKE, RECOVERY_TP, RECOVERY_SL) if is_rec else (BASE_STAKE, TAKE_PROFIT, STOP_LOSS)
+        pending_buys[rid] = {'symbol': symbol, 'direction': direction, 'recovery': is_rec,
+                             'stake': stake, 'tp': tp, 'sl': sl}
     req = {
         "buy":   "1",
-        "price": BASE_STAKE,                       # most we are willing to pay = the stake
+        "price": stake,                            # most we are willing to pay = the stake
         "parameters": {
-            "amount":            BASE_STAKE,
+            "amount":            stake,
             "basis":             "stake",
             "contract_type":     TRADE_CONTRACT[direction],
             "currency":          trader['currency'] or "USD",
             "multiplier":        mult,
             "underlying_symbol": symbol,
-            "limit_order":       {"take_profit": TAKE_PROFIT, "stop_loss": STOP_LOSS},
+            "limit_order":       {"take_profit": tp, "stop_loss": sl},
         },
         "req_id": rid,
     }
     try:
         trader['ws'].send(json.dumps(req))
-        print(f"[{get_ts()}] [{symbol}] ➜ sending {TRADE_CONTRACT[direction]}  stake={BASE_STAKE}  "
-              f"x{mult}  TP={TAKE_PROFIT}  SL={STOP_LOSS}")
+        print(f"[{get_ts()}] [{symbol}] ➜ sending {TRADE_CONTRACT[direction]}{' (RECOVERY)' if is_rec else ''}  "
+              f"stake={stake}  x{mult}  TP={tp}  SL={sl}")
     except Exception as e:
         with trade_lock:
             pending_buys.pop(rid, None)
+            if is_rec:
+                recovery_state['pending'] = True   # the recovery turn was not used
+
         _skip(symbol, direction, f"send failed: {type(e).__name__}: {e}")
 
 
@@ -1019,6 +1037,7 @@ def _t_on_open(ws):
         _notify_status("STARTED ✅",
                        f"Auto-trading is ON ({trader['mode']} account)\n"
                        f"Stake: {BASE_STAKE} | TP: {TAKE_PROFIT} | SL: {STOP_LOSS}\n"
+                       f"Recovery after a loss: stake {RECOVERY_STAKE} | TP {RECOVERY_TP} | SL {RECOVERY_SL}\n"
                        f"Max open trades: {MAX_OPEN_TRADES} | Close on EXIT: {CLOSE_ON_EXIT}\n"
                        f"Waiting for live signals — you will get a message for every trade.")
     _notified['error'] = ''
@@ -1071,6 +1090,8 @@ def _t_on_message(ws, message):
         text = f"{err.get('code', '')}: {err.get('message', err)}" if isinstance(err, dict) else str(err)
         with trade_lock:
             p = pending_buys.pop(rid, None)
+            if p and p.get('recovery'):
+                recovery_state['pending'] = True   # the recovery turn was not used
         if p:
             trader['last_error'] = text
             print(f"[{get_ts()}] [{p['symbol']}] ❌ TRADE REJECTED ({p['direction']}): {text}")
@@ -1102,19 +1123,24 @@ def _on_buy(ws, rid, b):
     cid = b.get('contract_id')
     with trade_lock:
         p = pending_buys.pop(rid, None) or {'symbol': '?', 'direction': '?'}
+        p.setdefault('recovery', False)
+        p.setdefault('tp', TAKE_PROFIT)
+        p.setdefault('sl', STOP_LOSS)
         if cid is not None:
             open_trades[cid] = {'symbol': p['symbol'], 'direction': p['direction'],
-                                'stake': b.get('buy_price', BASE_STAKE), 'opened': time.time()}
+                                'stake': b.get('buy_price', BASE_STAKE), 'opened': time.time(),
+                                'recovery': p['recovery']}
     if cid is None:
         print(f"[{get_ts()}] ⚠ buy response without a contract id: {b}")
         return
     _t_send(ws, {"proposal_open_contract": 1, "contract_id": cid, "subscribe": 1, "req_id": next(req_counter)})
-    print(f"[{get_ts()}] [{p['symbol']}] ✅ TRADE OPENED {TRADE_CONTRACT.get(p['direction'], '?')}  "
+    kind = "RECOVERY" if p['recovery'] else "NORMAL"
+    print(f"[{get_ts()}] [{p['symbol']}] ✅ TRADE OPENED ({kind}) {TRADE_CONTRACT.get(p['direction'], '?')}  "
           f"contract={cid}  price={b.get('buy_price')}")
-    _trade_csv("OPENED", p['symbol'], p['direction'], cid, f"buy_price={b.get('buy_price')}")
-    _trade_notify("OPENED", p['symbol'], p['direction'],
+    _trade_csv("OPENED", p['symbol'], p['direction'], cid, f"{kind} buy_price={b.get('buy_price')}")
+    _trade_notify("OPENED" + (" (RECOVERY)" if p['recovery'] else ""), p['symbol'], p['direction'],
                   f"Contract: {TRADE_CONTRACT.get(p['direction'], '?')}  #{cid}\n"
-                  f"Stake: {b.get('buy_price', BASE_STAKE)}\nTP: {TAKE_PROFIT}   SL: {STOP_LOSS}")
+                  f"Stake: {b.get('buy_price', p['stake'] if 'stake' in p else BASE_STAKE)}\nTP: {p['tp']}   SL: {p['sl']}")
 
 
 def _on_poc(c):
@@ -1130,7 +1156,17 @@ def _on_poc(c):
     profit = c.get('profit')
     print(f"[{get_ts()}] [{t['symbol']}] 🏁 TRADE CLOSED {t['direction']}  contract={cid}  profit={profit}")
     _trade_csv("CLOSED", t['symbol'], t['direction'], cid, f"status={c.get('status')}", profit if profit is not None else "")
-    _trade_notify("CLOSED", t['symbol'], t['direction'], f"Contract: #{cid}\nProfit: {profit}")
+    extra = ""
+    try:
+        was_recovery = bool(t.get('recovery')) or float(t.get('stake') or 0) >= RECOVERY_STAKE
+        if RECOVERY_ENABLED and profit is not None and float(profit) < 0 and not was_recovery:
+            recovery_state['pending'] = True
+            extra = f"\n⚠ Loss on a normal trade — the NEXT trade will be a RECOVERY trade (stake {RECOVERY_STAKE}, TP {RECOVERY_TP}, SL {RECOVERY_SL})."
+            print(f"[{get_ts()}] Recovery armed: next trade = stake {RECOVERY_STAKE}, TP {RECOVERY_TP}, SL {RECOVERY_SL}")
+    except (TypeError, ValueError):
+        pass
+    _trade_notify("CLOSED" + (" (RECOVERY)" if t.get('recovery') else ""), t['symbol'], t['direction'],
+                  f"Contract: #{cid}\nProfit: {profit}{extra}")
 
 
 def _on_portfolio(pf):
@@ -1195,7 +1231,8 @@ def start_trader():
         _notify_status("STARTED (signals only)", "Auto-trading is OFF: DERIV_PAT is not set. Signals still run.")
         return
     print(f"  Auto-trading: stake {BASE_STAKE}, TP {TAKE_PROFIT}, SL {STOP_LOSS}, max {MAX_OPEN_TRADES} open, "
-          f"close on EXIT: {CLOSE_ON_EXIT}\n")
+          f"close on EXIT: {CLOSE_ON_EXIT}")
+    print(f"  Recovery after a loss: {'ON' if RECOVERY_ENABLED else 'OFF'}  stake {RECOVERY_STAKE}, TP {RECOVERY_TP}, SL {RECOVERY_SL}\n")
     threading.Thread(target=_trade_worker, daemon=True).start()
     threading.Thread(target=_run_trade_ws, daemon=True).start()
 
