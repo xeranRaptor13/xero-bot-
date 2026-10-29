@@ -1382,6 +1382,360 @@ DIAG_COLS = [
 ]
 
 
+# ============================================================
+# SIGNAL EVIDENCE — when a LIVE 5-tick BUY / SELL is accepted, send to Telegram:
+#   (1) a picture of the 15-tick chart (higher time frame, the gate)
+#   (2) a picture of the 5-tick chart  (lower time frame, the entry)
+#   (3) a text log with the numbers behind the decision
+# Pictures are drawn with matplotlib from the SAME candles / lines the strategy just used (no browser needed).
+# Everything runs in its own background thread: it never slows down or blocks a trade, and if anything
+# in here fails the bot carries on exactly as before.
+# ============================================================
+
+EVIDENCE_ENABLED   = True
+EVIDENCE_CANDLES_15 = 60     # candles shown in the 15-tick picture
+EVIDENCE_CANDLES_5  = 100    # candles shown in the 5-tick picture
+
+evidence_queue = queue.Queue(maxsize=30)
+_evidence_started = {'on': False}
+
+
+def _shot_png(title, closed, forming, tpc, events, n_show, mark_ts=None, shade=None):
+    """One chart picture (PNG bytes): price + external BB on top, MAP / SIGNAL / internal BB below.
+    Lines are calculated from this series' own candles, exactly like the dashboard."""
+    from matplotlib.figure import Figure
+    from matplotlib.backends.backend_agg import FigureCanvasAgg
+    if not closed:
+        return None
+    bars     = list(closed) + ([forming] if forming else [])
+    closes   = [b['close'] for b in bars]
+    mp, sg, up, dn = mt5_series(closes)
+    n        = len(bars)
+    n_closed = len(closed)
+    times    = [_open_dt(b['open_time']) for b in bars]
+    lo       = max(0, n - n_show)
+    idx      = list(range(lo, n))
+
+    BG, FG, GRID = '#080c10', '#d0d7de', '#1b2430'
+    fig = Figure(figsize=(11, 7.4), dpi=110, facecolor=BG)
+    FigureCanvasAgg(fig)
+    ax1 = fig.add_axes([0.065, 0.40, 0.915, 0.50], facecolor='#0d1117')
+    ax2 = fig.add_axes([0.065, 0.09, 0.915, 0.27], facecolor='#0d1117', sharex=ax1)
+    for ax in (ax1, ax2):
+        ax.grid(True, color=GRID, lw=0.6)
+        ax.tick_params(colors=FG, labelsize=8)
+        for sp in ax.spines.values():
+            sp.set_color(GRID)
+
+    # candles
+    for i in idx:
+        b = bars[i]
+        is_forming = (i == n_closed)
+        up_c = b['close'] >= b['open']
+        col = '#26a69a' if up_c else '#ef5350'
+        edge = '#ffd54f' if is_forming else col
+        ax1.vlines(i, b['low'], b['high'], color=edge, lw=1.0)
+        h = abs(b['close'] - b['open'])
+        ax1.bar(i, h if h > 0 else (b['high'] - b['low']) * 0.02 or 1e-9, bottom=min(b['open'], b['close']),
+                width=0.62, color=('none' if is_forming else col), edgecolor=edge, linewidth=1.2 if is_forming else 0.6)
+
+    # external Bollinger on price (the 15-tick panel hides it when HTF_RULES_ONLY, like the dashboard)
+    hide_ext = HTF_RULES_ONLY and tpc == TICKS_PER_CANDLE and tpc != TICKS_PER_CANDLE_2
+    ex_i, ex_u, ex_d = [], [], []
+    if not hide_ext:
+        for i in idx:
+            if i >= EXT_BB_PERIOD - 1:
+                u_, d_ = calc_bb(closes[i - EXT_BB_PERIOD + 1:i + 1], EXT_BB_PERIOD, EXT_BB_DEVIATION)
+                if u_ is not None:
+                    ex_i.append(i); ex_u.append(u_); ex_d.append(d_)
+        if ex_i:
+            ax1.plot(ex_i, ex_u, color='#4caf50', lw=1.1, label=f'ExtBB({EXT_BB_PERIOD},{EXT_BB_DEVIATION})')
+            ax1.plot(ex_i, ex_d, color='#4caf50', lw=1.1)
+            ax1.plot(ex_i, [(a + b_) / 2 for a, b_ in zip(ex_u, ex_d)], color='#4caf50', lw=0.8, ls=':')
+
+    # signal markers of this series
+    tindex = {t: i for i, t in enumerate(times)}
+    mk = {'BUY': ('^', '#00e676', 'BUY signal', 120), 'SELL': ('v', '#ff5252', 'SELL signal', 120)}
+    shown = set()
+    for e in events or []:
+        i = tindex.get(e['ts'])
+        if i is None or i < lo:
+            continue
+        k = e['kind']
+        if k in mk:
+            m, colr, lab, sz = mk[k]
+            ax1.scatter([i], [e['close']], marker=m, s=sz, color=colr, edgecolor='white', linewidth=0.8, zorder=5,
+                        label=None if lab in shown else lab)
+            shown.add(lab)
+        elif k.startswith('EXIT'):
+            ax1.scatter([i], [e['close']], marker='x', s=60, color='white', zorder=5,
+                        label=None if 'EXIT' in shown else 'EXIT'); shown.add('EXIT')
+        elif k.startswith('INVALID'):
+            ax1.scatter([i], [e['close']], marker='x', s=70, color='#ff1744', zorder=5,
+                        label=None if 'invalid' in shown else 'invalid (cancelled)'); shown.add('invalid')
+        elif k.startswith('BLOCKED'):
+            ax1.scatter([i], [e['close']], marker='s', s=50, facecolors='none', edgecolors='#ff9800', zorder=5,
+                        label=None if 'blocked' in shown else 'blocked (no 15-tick)'); shown.add('blocked')
+
+    # 15-tick: shade the stretch where the 15-tick signal is valid
+    if shade:
+        since, direction = shade
+        si = next((i for i in idx if times[i] >= since), None)
+        colr = '#00e676' if direction == 'BUY' else '#ff5252'
+        if si is None:
+            si = lo
+        for ax in (ax1, ax2):
+            ax.axvspan(max(si, lo) - 0.5, n - 0.5, color=colr, alpha=0.10, lw=0)
+        ax1.text(max(si, lo), 0.97, f" 15-tick {direction} valid since {_fmt_t(since)}", transform=ax1.get_xaxis_transform(),
+                 color=colr, fontsize=9, va='top', ha='left', fontweight='bold')
+
+    # the signal candle (5-tick picture): a vertical line on the newest bar
+    if mark_ts is not None:
+        mi = tindex.get(mark_ts, n - 1)
+        for ax in (ax1, ax2):
+            ax.axvline(mi, color='#ffd54f', lw=1.0, ls='--', alpha=0.8)
+        ax1.text(mi, 0.03, ' signal candle', transform=ax1.get_xaxis_transform(), color='#ffd54f', fontsize=8,
+                 va='bottom', ha='left')
+
+    # price axis
+    pv = [bars[i]['low'] for i in idx] + [bars[i]['high'] for i in idx] + ex_u + ex_d
+    if pv:
+        lo_p, hi_p = min(pv), max(pv)
+        pad = (hi_p - lo_p) * 0.08 or 0.01
+        ax1.set_ylim(lo_p - pad, hi_p + pad)
+
+    # MAP / SIGNAL / internal BB
+    def line(vals, **kw):
+        pts = [(i, vals[i]) for i in idx if vals[i] is not None]
+        if pts:
+            ax2.plot([p[0] for p in pts], [p[1] for p in pts], **kw)
+    line(mp, color='#ffd700', lw=1.8, label='MAP')
+    line(sg, color='#42a5f5', lw=1.4, ls=':', label='SIGNAL')
+    bb_src = 'SIGNAL' if BB_ON_SIGNAL else 'MAP'
+    line(up, color='#26a69a', lw=1.0, ls='--', label=f'IntBB up ({BB_PERIOD},{BB_DEVIATION}) on {bb_src}')
+    line(dn, color='#ef5350', lw=1.0, ls='--', label='IntBB down')
+    ax2.axhline(0, color='#ffffff', lw=0.5, alpha=0.2, ls='--')
+    ind = [v[i] for v in (mp, sg, up, dn) for i in idx if v[i] is not None]
+    if ind:
+        lo_, hi_ = min(ind), max(ind)
+        rng = (hi_ - lo_) or 1.0
+        ax2.set_ylim(lo_ - rng * 0.15, hi_ + rng * 0.15)
+
+    ax1.set_xlim(lo - 1, n + max(3, int((n - lo) * 0.06)))
+    # time labels
+    step = max(1, (n - lo) // 8)
+    ticks = list(range(lo, n, step))
+    ax2.set_xticks(ticks)
+    ax2.set_xticklabels([times[i].strftime('%H:%M:%S') for i in ticks], rotation=0, fontsize=8, color=FG)
+    ax1.tick_params(labelbottom=False)
+
+    for ax in (ax1, ax2):
+        leg = ax.legend(loc='upper left' if ax is ax2 else 'lower right', fontsize=7, facecolor='#0d1117',
+                        edgecolor=GRID, labelcolor=FG, framealpha=0.85)
+
+    last = n - 1
+    def f(x):
+        return "—" if x is None else f"{x:.4f}"
+    fig.text(0.065, 0.955, title, color='#ffffff', fontsize=13, fontweight='bold', ha='left')
+    fig.text(0.065, 0.925, f"latest bar {_fmt_t(times[last])}   MAP {f(mp[last])}   SIGNAL {f(sg[last])}   "
+                           f"IntBB {f(dn[last])} … {f(up[last])}   (yellow outline = forming bar 0)",
+             color=FG, fontsize=8.5, ha='left')
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', facecolor=BG)
+    return buf.getvalue()
+
+
+def _queue_evidence(symbol5, kind, c, ts, row):
+    """Called the moment a LIVE 5-tick BUY / SELL is accepted. Copies what the pictures and the log need
+    (data_lock is re-entrant, so this is safe from inside the tick handler) and hands it to the worker."""
+    if not EVIDENCE_ENABLED or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    base = symbol5[:-len(T5)]
+    with data_lock:
+        sd = symbol_data.get(base)
+        if sd is None:
+            return
+        tail = _tail_len()
+        job = {
+            'base': base, 'symbol5': symbol5, 'kind': kind, 'ts': ts, 'candle': dict(c), 'row': dict(zip(DIAG_COLS, row)),
+            'closed15':  list(sd['closed'])[-(EVIDENCE_CANDLES_15 + tail):],
+            'forming15': dict(sd['forming']) if sd['forming'] else None,
+            'closed5':   list(sd['closed5'])[-(EVIDENCE_CANDLES_5 + tail):],
+            'forming5':  dict(sd['forming5']) if sd['forming5'] else None,
+            'events15':  list(dashboard_data['signals'].get(base, [])),
+            'events5':   list(dashboard_data['signals'].get(symbol5, [])),
+            'active15':  sd.get('active'), 'since15': sd.get('active_since'),
+        }
+        ok, info = _htf_permits(symbol5, kind, c.get('end') or c.get('open_time'))
+        job['gate_ok'], job['gate_info'] = ok, info
+    job['recovery_next'] = bool(globals().get('recovery_state', {}).get('pending'))
+    job['trading_on']    = bool(trader.get('enabled'))
+    try:
+        evidence_queue.put_nowait(job)
+    except queue.Full:
+        print(f"[{get_ts()}] evidence queue full — skipped the pictures for {base} {kind}")
+        return
+    if not _evidence_started['on']:
+        _evidence_started['on'] = True
+        threading.Thread(target=_evidence_worker, daemon=True).start()
+
+
+def _line_vals(closed, forming):
+    bars = list(closed) + ([forming] if forming else [])
+    if not bars:
+        return None
+    mp, sg, up, dn = mt5_series([b['close'] for b in bars])
+    return {'bars': bars, 'mp': mp, 'sg': sg, 'up': up, 'dn': dn}
+
+
+def _build_evidence(job):
+    """Returns (png15, png5, log_text, caption). Never raises for a drawing problem: a failed picture is None."""
+    base, kind, ts, row = job['base'], job['kind'], job['ts'], job['row']
+    name = get_symbol_name(base)
+    arrow = "BUY ▲" if kind == 'BUY' else "SELL ▼"
+
+    png15 = png5 = None
+    err = []
+    try:
+        png15 = _shot_png(f"{name} — 15-TICK (higher time frame · the gate)", job['closed15'], job['forming15'],
+                          TICKS_PER_CANDLE, job['events15'], EVIDENCE_CANDLES_15,
+                          shade=(job['since15'], job['active15']) if job['active15'] and job['since15'] else None)
+    except Exception as e:
+        err.append(f"15-tick picture failed: {type(e).__name__}: {e}")
+    try:
+        png5 = _shot_png(f"{name} — 5-TICK (lower time frame · the entry) — {arrow}", job['closed5'], job['forming5'],
+                         TICKS_PER_CANDLE_2, job['events5'], EVIDENCE_CANDLES_5, mark_ts=ts)
+    except Exception as e:
+        err.append(f"5-tick picture failed: {type(e).__name__}: {e}")
+
+    # ---- the log ----
+    L = []
+    add = L.append
+    add("XERO SIGNAL EVIDENCE")
+    add("=" * 62)
+    add(f"Instrument   : {name} ({base})")
+    add(f"Signal       : {kind}  (5-tick entry)")
+    add(f"Candle time  : {_fmt_t(ts)}      detected: {row.get('detected') or 'candle close'}")
+    add(f"Sent at      : {get_dt()}")
+    add(f"Running on   : {_run_label()}")
+    if job['trading_on']:
+        if RECOVERY_ENABLED and job['recovery_next']:
+            add(f"Trade        : RECOVERY trade (stake {RECOVERY_STAKE}, TP {RECOVERY_TP}, SL {RECOVERY_SL})")
+        else:
+            add(f"Trade        : NORMAL trade (stake {BASE_STAKE}, TP {TAKE_PROFIT}, SL {STOP_LOSS})")
+    else:
+        add("Trade        : none (auto-trading is OFF — signal only)")
+    add("")
+    add(f"--- 1) HIGHER TIME FRAME ({TICKS_PER_CANDLE}-TICK) — must agree with the entry ---")
+    if job['gate_ok']:
+        w = job['gate_info']
+        add(f"GATE         : PASS — a {TICKS_PER_CANDLE}-tick {kind} was valid at this moment (since {_fmt_t(w['since'])})")
+    else:
+        add(f"GATE         : FAIL — {job['gate_info']}")
+    add(f"15-tick state: active signal = {job['active15'] or 'none'}"
+        + (f", valid since {_fmt_t(job['since15'])}" if job['since15'] and job['active15'] else ""))
+    lv = _line_vals(job['closed15'], job['forming15'])
+    if lv:
+        n15 = len(lv['bars'])
+        i = n15 - (2 if job['forming15'] and n15 >= 2 else 1)
+        j = n15 - 1
+        def g(x): return "—" if x is None else f"{x:.5f}"
+        add(f"Last closed 15-tick candle {_fmt_t(_open_dt(lv['bars'][i]['open_time']))}: close {lv['bars'][i]['close']}")
+        add(f"   MAP {g(lv['mp'][i])}   SIGNAL {g(lv['sg'][i])}   IntBB up {g(lv['up'][i])}   IntBB down {g(lv['dn'][i])}")
+        if job['forming15']:
+            add(f"Forming 15-tick bar 0: close {lv['bars'][j]['close']}   MAP {g(lv['mp'][j])}   SIGNAL {g(lv['sg'][j])}")
+    add("")
+    add(f"--- 2) LOWER TIME FRAME ({TICKS_PER_CANDLE_2}-TICK) — the entry rules ---")
+    add(f"Strategy result : {row.get('strategy_result') or kind}")
+    add(f"Program's reason: {row.get('decision_detail') or '—'}")
+    c = job['candle']
+    add(f"Candle          : open {c['open']}  high {c['high']}  low {c['low']}  close {c['close']}")
+    add(f"MAP {row.get('map')}   SIGNAL {row.get('signal')}")
+    add(f"Internal BB     : up {row.get('intbb_up')}   down {row.get('intbb_dn')}   width {row.get('band_width')}   "
+        f"min depth (5%) {row.get('min_depth_5pct')}")
+    add(f"External BB     : up {row.get('extbb_up')}   down {row.get('extbb_dn')}")
+    def yn(v): return {1: 'YES', 0: 'no', '1': 'YES', '0': 'no'}.get(v, '—')
+    add("Checks (YES = true):")
+    add(f"   MAP above up band: {yn(row.get('map_above_up'))}    SIGNAL above up band: {yn(row.get('sig_above_up'))}")
+    add(f"   MAP below dn band: {yn(row.get('map_below_dn'))}    SIGNAL below dn band: {yn(row.get('sig_below_dn'))}")
+    add(f"   MAP rising: {yn(row.get('map_rising'))}    MAP falling: {yn(row.get('map_falling'))}  (previous MAP {row.get('prev_map')})")
+    add(f"   Close above ExtBB up: {yn(row.get('close_above_extbb_up'))}    Close below ExtBB down: {yn(row.get('close_below_extbb_dn'))}")
+    add(f"Excursion       : before = {row.get('exc_state_before') or '—'}, after = {row.get('exc_state_after') or '—'}, "
+        f"candles outside = {row.get('exc_candles_after')}, extreme = {row.get('exc_extreme_after')}, "
+        f"depth beyond band = {row.get('exc_depth_after')}")
+    add(f"   curved (turned) = {yn(row.get('exc_curved_after'))}    both lines were out = {yn(row.get('exc_both_out_after'))}")
+    add(f"Last direction before: {row.get('last_dir_before') or '—'}   open signal before: {row.get('active_before') or 'none'}")
+    add(f"Events on this candle: {row.get('final_events') or kind}")
+    if err:
+        add("")
+        add("NOTE: " + " | ".join(err))
+    add("")
+    add("The lines repaint: the pictures show the chart at the moment the signal fired.")
+
+    cap = f"{name} — {arrow}\n"
+    cap += (f"15-tick gate: PASS ({TICKS_PER_CANDLE}-tick {kind} valid since {_fmt_t(job['gate_info']['since'])})"
+            if job['gate_ok'] else f"15-tick gate: FAIL — {job['gate_info']}")
+    return png15, png5, "\n".join(L), cap[:1000]
+
+
+def _tg_post(method, data=None, files=None):
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/{method}"
+    for attempt in range(1, 4):
+        try:
+            r = requests.post(url, data=data, files=files, timeout=45)
+            if r.status_code == 200:
+                return True
+            print(f"[{get_ts()}] Telegram {method} error (try {attempt}/3): {r.text[:200]}")
+            if r.status_code == 429:
+                time.sleep(5 * attempt)
+        except Exception as e:
+            print(f"[{get_ts()}] Telegram {method} exception (try {attempt}/3): {e}")
+        time.sleep(attempt)
+    return False
+
+
+def _evidence_worker():
+    while running:
+        try:
+            job = evidence_queue.get(timeout=1)
+        except queue.Empty:
+            continue
+        try:
+            png15, png5, text, cap = _build_evidence(job)
+            stamp = job['ts'].strftime('%Y%m%d_%H%M%S')
+            tag = f"{job['base']}_{job['kind']}_{stamp}"
+            # keep a copy in the log folder too (it is saved with the run's logs)
+            try:
+                os.makedirs(LOG_DIR, exist_ok=True)
+                with open(_csv_path(f"evidence_{tag}.txt"), "w", encoding="utf-8") as fh:
+                    fh.write(text)
+                for lab, png in (("15tick", png15), ("5tick", png5)):
+                    if png:
+                        with open(_csv_path(f"evidence_{tag}_{lab}.png"), "wb") as fh:
+                            fh.write(png)
+            except Exception as e:
+                print(f"[{get_ts()}] could not save the evidence files: {e}")
+            pics = [(lab, png) for lab, png in (("15tick", png15), ("5tick", png5)) if png]
+            if len(pics) == 2:
+                media = [{"type": "photo", "media": "attach://p15", "caption": cap},
+                         {"type": "photo", "media": "attach://p5"}]
+                _tg_post("sendMediaGroup", data={"chat_id": TELEGRAM_CHAT_ID, "media": json.dumps(media)},
+                         files={"p15": (f"{tag}_15tick.png", png15, "image/png"),
+                                "p5":  (f"{tag}_5tick.png",  png5,  "image/png")})
+            elif len(pics) == 1:
+                lab, png = pics[0]
+                _tg_post("sendPhoto", data={"chat_id": TELEGRAM_CHAT_ID, "caption": cap},
+                         files={"photo": (f"{tag}_{lab}.png", png, "image/png")})
+            else:
+                _tg_post("sendMessage", data={"chat_id": TELEGRAM_CHAT_ID, "text": cap + "\n(pictures could not be drawn)"})
+            _tg_post("sendDocument", data={"chat_id": TELEGRAM_CHAT_ID, "caption": f"Log — {get_symbol_name(job['base'])} {job['kind']}"},
+                     files={"document": (f"xero_{tag}.txt", text.encode("utf-8"), "text/plain")})
+            print(f"[{get_ts()}] [{job['base']}] evidence sent to Telegram ({job['kind']})")
+        except Exception as e:
+            print(f"[{get_ts()}] ⚠ evidence error: {type(e).__name__}: {e}")
+        time.sleep(1.5)   # stay well inside Telegram's rate limits
+
+
 def _tf_snap(tf):
     return {k: tf.get(k) for k in ('excursion_state', 'excursion_candles', 'excursion_extreme',
                                     'excursion_curved', 'excursion_both_out', 'prev_map')}
@@ -1457,6 +1811,14 @@ def _write_diag(symbol, sd, c, ts, o, kinds, last_dir_before, active_before, his
     with csv_lock:
         diag_rows.setdefault(symbol, []).append(row)
         _csv_safe(_diag_path(symbol), "a", [row])
+    # LIVE 5-tick entry accepted -> pictures of both time frames + the log go to Telegram (background thread)
+    if (not historical) and symbol.endswith(T5):
+        for k_ in kinds:
+            if k_ in ('BUY', 'SELL'):
+                try:
+                    _queue_evidence(symbol, k_, c, ts, row)
+                except Exception as e:
+                    print(f"[{get_ts()}] ⚠ evidence not queued: {type(e).__name__}: {e}")
 
 
 # ============================================================
