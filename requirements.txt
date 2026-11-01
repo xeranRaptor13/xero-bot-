@@ -1,5 +1,0 @@
-websocket-client
-plotly
-dash
-dash-bootstrap-components
-requests
