@@ -8,7 +8,7 @@ on:
   # Lets you start it by hand from the Actions tab.
   workflow_dispatch:
 
-# Never two bots at the same time (two bots = double trades).
+# Never two copies at the same time.
 concurrency:
   group: xero-bot
   cancel-in-progress: false
@@ -28,17 +28,13 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Run the bot for 5h50m
+      - name: Run the 3m + 5m monitor for 5h50m
         env:
-          TELEGRAM_TOKEN:     ${{ secrets.TELEGRAM_TOKEN }}
-          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
-          DERIV_PAT:          ${{ secrets.DERIV_PAT }}
-          DERIV_APP_ID:       ${{ secrets.DERIV_APP_ID }}
-          DERIV_ACCOUNT_ID:   ${{ secrets.DERIV_ACCOUNT_ID }}
-          ALLOW_REAL_TRADING: ${{ vars.ALLOW_REAL_TRADING || '0' }}
+          TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          # SIGINT after 350 minutes = the bot's normal Ctrl+C shutdown. Exit code 124 just means "time is up".
-          timeout -s INT -k 60 350m python -u xero_signal_15tick_5tick_enforced.py || code=$?
+          # SIGINT after 350 minutes = the script's normal Ctrl+C shutdown. Exit code 124 just means "time is up".
+          timeout --foreground -s INT -k 60 350m python -u xero_signal_3m5m.py || code=$?
           if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then exit "$code"; fi
 
       - name: Save the logs
