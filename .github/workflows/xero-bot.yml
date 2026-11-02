@@ -1,17 +1,25 @@
 name: Xero bot
 
 on:
-  # Starts at 04:35, 10:35, 16:35 and 22:35 UTC (05:35, 11:35, 17:35 and 23:35 Nigerian time).
-  # Each run lasts 5h50m, so there is a ~10 minute gap before the next one.
+  # Safety net only: if the chain ever breaks, the next slot restarts the bot.
   schedule:
     - cron: "35 4,10,16,22 * * *"
-  # Lets you start it by hand from the Actions tab.
+  # Start it by hand from the Actions tab. "chained" is set to true only by the run that starts its successor.
   workflow_dispatch:
+    inputs:
+      chained:
+        description: "Started by the previous run (adds the short break). Leave false when you start it yourself."
+        type: boolean
+        default: false
 
-# Never two copies at the same time.
+# Never two copies at the same time. A new run waits (pending) until the running one has finished.
 concurrency:
   group: xero-bot
   cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write        # needed so a run can start the next run
 
 jobs:
   run-bot:
@@ -19,6 +27,18 @@ jobs:
     timeout-minutes: 358          # hard safety net (GitHub's own limit is 360)
     steps:
       - uses: actions/checkout@v4
+
+      # 1) Line up the NEXT run right now. It stays "pending" until this run has finished, then starts by itself.
+      - name: Queue the next run
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh workflow run xero-bot.yml --repo "${{ github.repository }}" --ref "${{ github.ref_name }}" -f chained=true
+
+      # 2) The break between runs (only for runs that were started by the previous run).
+      - name: Short break between runs
+        if: ${{ inputs.chained }}
+        run: sleep 120
 
       - uses: actions/setup-python@v5
         with:
