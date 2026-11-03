@@ -48,13 +48,13 @@ jobs:
       - name: Install requirements
         run: pip install -r requirements.txt
 
-      - name: Run the 3m + 5m monitor for 5h50m
+      - name: Run the 5m + 1h monitor for 5h50m
         env:
           TELEGRAM_TOKEN:   ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           # SIGINT after 350 minutes = the script's normal Ctrl+C shutdown. Exit code 124 just means "time is up".
-          timeout --foreground -s INT -k 60 350m python -u xero_signal_3m5m.py || code=$?
+          timeout --foreground -s INT -k 60 350m python -u xero_signal_5m1h.py || code=$?
           if [ "${code:-0}" -ne 0 ] && [ "${code:-0}" -ne 124 ]; then exit "$code"; fi
 
       - name: Save the logs
